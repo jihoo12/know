@@ -120,8 +120,10 @@ def cidx(world, e, t):
     return world["n"] + (e * NT + t) * NC
 
 
-def build_sheaf(world, claims, isometric=True):
-    """Return per-claim (A_c, y_c) blocks with A_c acting on the world vector."""
+def build_sheaf(world, claims, isometric=True, continuity=0.0):
+    """Return per-claim (A_c, y_c) blocks with A_c acting on the world vector.
+    continuity > 0 appends soft prior blocks continuity * (city[e,t] - city[e,t+1]) = 0
+    after the claims ("people usually stay put"); they are never reported as flags."""
     dim = world["n"] + world["n"] * NT * NC
     blocks = []
     for c in claims:
@@ -144,6 +146,14 @@ def build_sheaf(world, claims, isometric=True):
             A = sp.lil_matrix((NK, dim)); A[:, o:o + NC] = M; A = A.tocsr()
             y = np.zeros(NK); y[c["value"]] = M[c["value"]].max()
         blocks.append((A, y))
+    for e in range(world["n"]) if continuity else ():
+        for t in range(NT - 1):
+            o0, o1 = cidx(world, e, t), cidx(world, e, t + 1)
+            A = sp.csr_matrix((np.r_[np.full(NC, continuity), np.full(NC, -continuity)],
+                               (np.r_[np.arange(NC), np.arange(NC)],
+                                np.r_[np.arange(o0, o0 + NC), np.arange(o1, o1 + NC)])),
+                              shape=(NC, dim))
+            blocks.append((A, np.zeros(NC)))
     return blocks
 
 
@@ -178,12 +188,12 @@ def robust_fit(blocks, iters=60, eps=1e-3):
     return z, r
 
 
-def detect_sheaf(world, claims, thresh=0.3, isometric=True):
+def detect_sheaf(world, claims, thresh=0.3, isometric=True, continuity=0.0):
     """Flag claims with large robust residual. With isometric restriction maps an
     undecidable 1-vs-1 conflict splits its residual evenly (~0.5 each for one-hot
     stalks), so the threshold sits below that to flag both sides of a tie."""
-    z, r = robust_fit(build_sheaf(world, claims, isometric))
-    return {i for i, ri in enumerate(r) if ri > thresh}, z
+    z, r = robust_fit(build_sheaf(world, claims, isometric, continuity))
+    return {i for i, ri in enumerate(r[:len(claims)]) if ri > thresh}, z
 
 
 # ---------------------------------------------------------------- baselines
@@ -255,6 +265,78 @@ def detect_rules(world, claims):
     return flagged
 
 
+def _fundamental_cycles(n_nodes, edges):
+    """edges: list of (u, v, d, claim_idx) meaning x_u - x_v = d.
+    Returns [(discrepancy, [claim_idx, ...])] for each fundamental cycle of a BFS forest."""
+    adj = [[] for _ in range(n_nodes)]
+    for k, (u, v, d, _) in enumerate(edges):
+        adj[u].append((v, k)); adj[v].append((u, k))
+    pot, depth, parent = [None] * n_nodes, [0] * n_nodes, [None] * n_nodes
+    tree = set()
+    for s in range(n_nodes):
+        if pot[s] is not None:
+            continue
+        pot[s], queue = 0, [s]
+        while queue:
+            u = queue.pop(0)
+            for v, k in adj[u]:
+                if pot[v] is None:
+                    eu, ev, d, _ = edges[k]
+                    pot[v] = pot[u] - d if eu == u else pot[u] + d
+                    depth[v], parent[v] = depth[u] + 1, (u, k)
+                    tree.add(k); queue.append(v)
+    cycles = []
+    for k, (u, v, d, idx) in enumerate(edges):
+        if k in tree:
+            continue
+        path, a, b = [idx], u, v
+        while a != b:
+            if depth[a] < depth[b]:
+                a, b = b, a
+            a, kk = parent[a]
+            path.append(edges[kk][3])
+        cycles.append((pot[u] - pot[v] - d, path))
+    return cycles
+
+
+def detect_rules_cycles(world, claims):
+    """`rules` for places, plus a greedy cycle-consistency check over all birth-type
+    claims (birth/age as edges to a virtual root, reldiff as edges between people):
+    repeatedly drop the claim lying on the most inconsistent fundamental cycles,
+    as in loop-closure outlier rejection. Places are handled exactly like `rules`."""
+    flagged = {i for i in detect_rules(world, claims)
+               if claims[i]["kind"] in ("city", "country")}
+    root = world["n"]
+    edges = []
+    for i, c in enumerate(claims):
+        if c["kind"] == "birth":
+            edges.append((c["e"], root, c["value"], i))
+        elif c["kind"] == "age":
+            edges.append((c["e"], root, c["t"] - c["value"], i))
+        elif c["kind"] == "reldiff":
+            edges.append((c["a"], c["b"], c["value"], i))
+    removed = []
+    while True:
+        cycles = _fundamental_cycles(root + 1, edges)
+        bad, good = {}, {}
+        for disc, path in cycles:
+            tally = bad if disc != 0 else good
+            for i in path:
+                tally[i] = tally.get(i, 0) + 1
+        if not bad:
+            break
+        worst = max(bad, key=lambda i: (bad[i], -good.get(i, 0)))
+        removed.append(next(e for e in edges if e[3] == worst))
+        edges = [e for e in edges if e[3] != worst]
+    # cleanup: greedy removal over-deletes; re-admit claims consistent with the rest
+    for e in removed:
+        if all(d == 0 for d, _ in _fundamental_cycles(root + 1, edges + [e])):
+            edges.append(e)
+        else:
+            flagged.add(e[3])
+    return flagged
+
+
 # ---------------------------------------------------------------- eval
 
 def prf(flagged, truth):
@@ -266,11 +348,10 @@ def prf(flagged, truth):
 
 
 def run(seeds=range(20), rates=(0.05, 0.10, 0.20)):
-    methods = {"naive": detect_naive, "rules": detect_rules,
+    methods = {"naive": detect_naive, "rules": detect_rules, "rules+cyc": detect_rules_cycles,
                "raw@.5": lambda w, c: detect_sheaf(w, c, 0.5, isometric=False)[0],
-               "raw@.3": lambda w, c: detect_sheaf(w, c, 0.3, isometric=False)[0],
-               "iso@.5": lambda w, c: detect_sheaf(w, c, 0.5)[0],
-               "iso@.3": lambda w, c: detect_sheaf(w, c, 0.3)[0]}
+               "iso@.3": lambda w, c: detect_sheaf(w, c, 0.3)[0],
+               "iso+cont": lambda w, c: detect_sheaf(w, c, 0.3, continuity=0.7)[0]}
     kinds = ["birth", "age", "reldiff", "city", "country"]
     print(f"{'rate':>5} {'method':>9} | {'P':>5} {'R':>5} {'F1':>5} | recall by kind: "
           + " ".join(f"{k:>7}" for k in kinds))
