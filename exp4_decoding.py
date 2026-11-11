@@ -110,6 +110,37 @@ def decode_greedy(E, dv, n):
     return out
 
 
+def decode_ransac(E, dv, n, rng, iters=300, guide=None):
+    """Consensus by random spanning trees: a tree fixes every x_i, count the claims
+    that disagree, keep the best. guide = per-claim penalty in [0, 1] added to the
+    random tree-sampling key, e.g. 0.5 * (L1 flags): trees then prefer, but are not
+    forced to use, the claims L1 believes. (Penalty 1 just reproduces the L1 answer.)"""
+    m = len(E)
+    best, best_bad = None, m + 1
+    for _ in range(iters):
+        key = rng.random(m) + (guide if guide is not None else 0)
+        comp = list(range(n))
+        adj = [[] for _ in range(n)]
+        for k in np.argsort(key):
+            u, v = int(E[k, 0]), int(E[k, 1])
+            ru, rv = u, v
+            while comp[ru] != ru: ru = comp[ru]
+            while comp[rv] != rv: rv = comp[rv]
+            if ru != rv:
+                comp[ru] = rv
+                adj[u].append((v, -dv[k])); adj[v].append((u, dv[k]))
+        x = np.zeros(n); seen = [False] * n; seen[0] = True; stack = [0]
+        while stack:
+            u = stack.pop()
+            for v, d in adj[u]:
+                if not seen[v]:
+                    seen[v] = True; x[v] = x[u] + d; stack.append(v)
+        bad = x[E[:, 0]] - x[E[:, 1]] != dv
+        if bad.sum() < best_bad:
+            best, best_bad = bad, bad.sum()
+    return best
+
+
 _CUTS = {}
 
 
@@ -179,6 +210,30 @@ def run_sweep(n=20, degrees=(4, 6, 10), rates=(0.05, 0.1, 0.15, 0.2, 0.3, 0.4), 
         print()
 
 
+def run_consensus(n=20, degrees=(4, 6, 10), rates=(0.05, 0.1, 0.15, 0.2, 0.3, 0.4), seeds=20,
+                  seed_base=0, guide=0.5):
+    """Cheap approximations of L0. seed_base=0 gives the same instances as run_sweep
+    (guide strength 0.5 was picked there); any other value is a held-out set."""
+    print(f"consensus by random spanning trees (300 trees), n={n}, seeds {seed_base}-"
+          f"{seed_base + seeds - 1}, exact-recovery rate")
+    print(f"{'deg':>3} {'q':>5} | {'l1':>6} {'ransac':>6} {'l1+ransac':>9} | P(clean tree)")
+    for d in degrees:
+        for q in rates:
+            ex = np.zeros(3)
+            for s in range(seed_base, seed_base + seeds):
+                rng = np.random.default_rng(1000 * d + s)
+                E, dv, err = instance(rng, n, d, q)
+                truth = err != 0
+                a = decode_l1(E, dv, n)
+                r2 = np.random.default_rng(s)
+                ex += [np.array_equal(x, truth) for x in
+                       (a, decode_ransac(E, dv, n, r2), decode_ransac(E, dv, n, r2, guide=guide * a))]
+            ex /= seeds
+            print(f"{d:3d} {q:5.2f} | {ex[0]:6.2f} {ex[1]:6.2f} {ex[2]:9.2f} | {(1 - q) ** (n - 1):.3f}",
+                  flush=True)
+        print()
+
+
 def run_cut_check(n=14, degrees=(4, 6), rates=(0.1, 0.2, 0.3, 0.4), seeds=100):
     """Verify the cut criterion against the LP, and see which cuts are the binding ones."""
     print(f"cut criterion vs LP, n={n} (all {2 ** (n - 1) - 1} cuts enumerated)")
@@ -205,8 +260,10 @@ def run_cut_check(n=14, degrees=(4, 6), rates=(0.1, 0.2, 0.3, 0.4), seeds=100):
 
 if __name__ == "__main__":
     t = time.time()
-    if "quick" in sys.argv:
+    if "consensus" in sys.argv:
+        run_consensus(); run_consensus(seed_base=500, seeds=50)
+    elif "quick" in sys.argv:
         run_cut_check(seeds=10); run_sweep(seeds=3)
     else:
-        run_cut_check(); run_sweep()
+        run_cut_check(); run_sweep(); run_consensus(); run_consensus(seed_base=500, seeds=50)
     print(f"({time.time() - t:.0f}s)")
