@@ -177,22 +177,28 @@ def obstruction_norm(blocks):
     return float(np.linalg.norm(A @ _wls(A, y, np.ones(len(y))) - y))
 
 
-def robust_fit(blocks, iters=60, eps=1e-3):
-    """IRLS for min_z sum_c ||A_c z - y_c||_2. Returns z and per-claim residual norms."""
+def robust_fit(blocks, iters=60, eps=1e-3, p=1.0, n_free=None):
+    """IRLS for min_z sum_c ||A_c z - y_c||_2^p. Returns z and per-claim residual norms.
+    p=1 is the convex group-L1 fit. p<1 runs the p=1 fit first and then continues with
+    the nonconvex penalty from that starting point (closer to "count the violated
+    claims"). Blocks from index n_free on (soft priors) always keep the p=1 penalty."""
     A, y, owner = _stack(blocks)
+    n_free = len(blocks) if n_free is None else n_free
     w = np.ones(len(blocks))
-    for _ in range(iters):
-        z = _wls(A, y, w[owner])
-        r = np.sqrt(np.bincount(owner, (A @ z - y) ** 2, minlength=len(blocks)))
-        w = 1.0 / np.maximum(r, eps)
+    for q in ((1.0,) if p == 1.0 else (1.0, p)):
+        for _ in range(iters):
+            z = _wls(A, y, w[owner])
+            r = np.sqrt(np.bincount(owner, (A @ z - y) ** 2, minlength=len(blocks)))
+            w = 1.0 / np.maximum(r, eps)
+            w[:n_free] **= 2.0 - q
     return z, r
 
 
-def detect_sheaf(world, claims, thresh=0.3, isometric=True, continuity=0.0):
+def detect_sheaf(world, claims, thresh=0.3, isometric=True, continuity=0.0, p=1.0):
     """Flag claims with large robust residual. With isometric restriction maps an
     undecidable 1-vs-1 conflict splits its residual evenly (~0.5 each for one-hot
     stalks), so the threshold sits below that to flag both sides of a tie."""
-    z, r = robust_fit(build_sheaf(world, claims, isometric, continuity))
+    z, r = robust_fit(build_sheaf(world, claims, isometric, continuity), p=p, n_free=len(claims))
     return {i for i, ri in enumerate(r[:len(claims)]) if ri > thresh}, z
 
 
@@ -315,9 +321,15 @@ def detect_rules_cycles(world, claims):
             edges.append((c["e"], root, c["t"] - c["value"], i))
         elif c["kind"] == "reldiff":
             edges.append((c["a"], c["b"], c["value"], i))
-    removed = []
+    return flagged | greedy_cycle_outliers(root + 1, edges)
+
+
+def greedy_cycle_outliers(n_nodes, edges):
+    """edges: [(u, v, d, idx)] meaning x_u - x_v = d. Greedy loop-closure-style
+    outlier rejection; returns the set of idx judged wrong."""
+    flagged, removed = set(), []
     while True:
-        cycles = _fundamental_cycles(root + 1, edges)
+        cycles = _fundamental_cycles(n_nodes, edges)
         bad, good = {}, {}
         for disc, path in cycles:
             tally = bad if disc != 0 else good
@@ -330,7 +342,7 @@ def detect_rules_cycles(world, claims):
         edges = [e for e in edges if e[3] != worst]
     # cleanup: greedy removal over-deletes; re-admit claims consistent with the rest
     for e in removed:
-        if all(d == 0 for d, _ in _fundamental_cycles(root + 1, edges + [e])):
+        if all(d == 0 for d, _ in _fundamental_cycles(n_nodes, edges + [e])):
             edges.append(e)
         else:
             flagged.add(e[3])
