@@ -13,6 +13,9 @@ minimiser iff for EVERY cut (S, S^c)
 i.e. L1 is a median vote across every cut. `cut_margin` checks this by brute force.
 """
 
+import contextlib
+import ctypes
+import os
 import sys
 import time
 from math import comb
@@ -85,6 +88,28 @@ def decode_irls(E, dv, n, p=1.0):
     return r > 0.5
 
 
+_libc = ctypes.CDLL(None)
+
+
+@contextlib.contextmanager
+def _quiet_stdout():
+    """HiGHS (behind scipy's milp) prints debug lines such as
+    'HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();' straight
+    through C stdio, even with disp=False. They sit in C's stdout buffer, so silence file
+    descriptor 1 and flush that buffer into the void before putting the descriptor back."""
+    sys.stdout.flush()
+    _libc.fflush(None)
+    saved = os.dup(1)
+    try:
+        with open(os.devnull, "w") as null:
+            os.dup2(null.fileno(), 1)
+        yield
+    finally:
+        _libc.fflush(None)
+        os.dup2(saved, 1)
+        os.close(saved)
+
+
 def decode_l0(E, dv, n, time_limit=8.0):
     """Exact max-consensus by big-M MILP. Returns (flags, proven_optimal)."""
     m = len(E)
@@ -92,12 +117,13 @@ def decode_l0(E, dv, n, time_limit=8.0):
     R = 50.0                                   # births span 50 years, so |x_u - x_v| <= R
     M = sp.diags(R + np.abs(dv).astype(float))  # per-claim big-M, as tight as the range allows
     A = sp.vstack([sp.hstack([B, -M]), sp.hstack([-B, -M])])
-    res = milp(np.r_[np.zeros(n), np.ones(m)],
-               constraints=LinearConstraint(A, -np.inf, np.r_[dv, -dv]),
-               integrality=np.r_[np.zeros(n), np.ones(m)],
-               bounds=Bounds(np.r_[0, -R * np.ones(n - 1), np.zeros(m)],
-                             np.r_[0, R * np.ones(n - 1), np.ones(m)]),
-               options=dict(time_limit=time_limit))
+    with _quiet_stdout():
+        res = milp(np.r_[np.zeros(n), np.ones(m)],
+                   constraints=LinearConstraint(A, -np.inf, np.r_[dv, -dv]),
+                   integrality=np.r_[np.zeros(n), np.ones(m)],
+                   bounds=Bounds(np.r_[0, -R * np.ones(n - 1), np.zeros(m)],
+                                 np.r_[0, R * np.ones(n - 1), np.ones(m)]),
+                   options=dict(time_limit=time_limit))
     if res.x is None:
         return np.ones(m, bool), False
     return np.abs(B @ res.x[:n] - dv) > 0.5, res.status == 0
